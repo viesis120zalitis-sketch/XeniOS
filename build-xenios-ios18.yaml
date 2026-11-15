@@ -1,0 +1,590 @@
+name: Build XeniOS IPA (iOS 18)
+
+# One file does everything: it applies the iOS 18 compatibility patch (embedded
+# below) to a fresh checkout, builds the complete iOS app on a GitHub-hosted
+# Xcode 27 runner, and delivers ONE file, XeniOS.ipa.
+#
+# Run it: Actions tab -> "Build XeniOS IPA (iOS 18)" -> Run workflow.
+#
+# The IPA is ad-hoc signed and unofficial: no attestation key, and no diagnostics
+# URL, so the app sends nothing anywhere. It must be re-signed by a sideloading
+# tool before it installs on a phone. Nothing here has been run yet: do not
+# assume the build succeeds or the app works until it does.
+
+"on":
+  workflow_dispatch:
+    inputs:
+      make_release:
+        description: "Also attach XeniOS.ipa to a GitHub pre-release (easiest download on a phone)"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write # only used to create the pre-release
+
+concurrency:
+  group: xenios-ios18-build
+  cancel-in-progress: false
+
+env:
+  # Apple's Metal Shader Converter for iOS, mirrored as a release asset. Same
+  # values as apple-publish.yml; the hash pins the file.
+  MSC_IOS_REPO: "xenios-jp/metal-shader-converter"
+  MSC_IOS_RELEASE_TAG: "ios-4.0.3"
+  MSC_IOS_SHA256: "bd6b729dcbde133a511d95130eb4d287a1e18b4170453f8b350e78a20bfc37aa"
+
+jobs:
+  build-ios18:
+    name: Build XeniOS.ipa (iOS 18.0 minimum)
+    runs-on: xcode-27
+    timeout-minutes: 355
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Apply the iOS 18 compatibility patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p logs
+          cat > "${RUNNER_TEMP}/ios18.patch" <<'XENIOS_IOS18_PATCH'
+          --- a/CMakeLists.txt
+          +++ b/CMakeLists.txt
+          @@ -3,11 +3,7 @@
+           
+           if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+             set(XE_PLATFORM_IOS TRUE)
+          -  set(CMAKE_OSX_DEPLOYMENT_TARGET "26.0" CACHE STRING "Minimum iOS version")
+          -  # XeniOS supports iOS 26 and later. Raise a build dir configured earlier.
+          -  if(CMAKE_OSX_DEPLOYMENT_TARGET VERSION_LESS 26.0)
+          -    set(CMAKE_OSX_DEPLOYMENT_TARGET "26.0" CACHE STRING "Minimum iOS version" FORCE)
+          -  endif()
+          +  set(CMAKE_OSX_DEPLOYMENT_TARGET "18.0" CACHE STRING "Minimum iOS version")
+           endif()
+           
+           # Must be set before project() so the toolchain bakes -mmacosx-version-min
+          --- a/src/xenia/ui/ios/CMakeLists.txt
+          +++ b/src/xenia/ui/ios/CMakeLists.txt
+          @@ -166,6 +166,8 @@
+             shared/ios_art_wash.mm
+             shared/ios_glass_card.h
+             shared/ios_glass_card.mm
+          +  shared/ios_ios18_compat.h
+          +  shared/ios_ios18_compat.mm
+             shared/ios_page_push.h
+             shared/ios_page_push.mm
+             shared/ios_edge_adapter.h
+          @@ -291,3 +293,11 @@
+           target_link_libraries(xenia-ui-ios PRIVATE zarchive zstd)
+           
+           xe_target_defaults(xenia-ui-ios)
+          +
+          +# iOS 18 port: the app targets iOS 18.0 but still calls some iOS 26 UIKit
+          +# APIs. ios_ios18_compat.mm polyfills the method-level ones at run time; every
+          +# remaining use is still printed as a warning so it can be reviewed. Added
+          +# after xe_target_defaults so it follows its -Werror.
+          +target_compile_options(xenia-ui-ios PRIVATE
+          +  -Wno-error=unguarded-availability-new
+          +)
+          --- /dev/null
+          +++ b/src/xenia/ui/ios/shared/ios_ios18_compat.h
+          @@ -0,0 +1,25 @@
+          +/**
+          + ******************************************************************************
+          + * Xenia : Xbox 360 Emulator Research Project                                 *
+          + ******************************************************************************
+          + * Copyright 2026 Ben Vanik. All rights reserved.                             *
+          + * Released under the BSD license - see LICENSE in the root for more details. *
+          + ******************************************************************************
+          + */
+          +
+          +#ifndef XENIA_UI_IOS_SHARED_IOS_IOS18_COMPAT_H_
+          +#define XENIA_UI_IOS_SHARED_IOS_IOS18_COMPAT_H_
+          +
+          +// iOS 18 compatibility layer. The UI was written for iOS 26 (Liquid Glass).
+          +// On older systems this adds the few UIKit methods that do not exist there, so
+          +// the call sites keep their iOS 26 code unchanged:
+          +//
+          +//   +[UIButtonConfiguration glassButtonConfiguration]  -> blurred capsule button
+          +//   -[UINavigationItem subtitle] / -setSubtitle:       -> stored, not drawn
+          +//   -[UIView cornerConfiguration] / -setCornerConfiguration: -> stored, not drawn
+          +//
+          +// Does nothing on iOS 26 and later. Installed once, at image load, from
+          +// ios_view_helpers.mm (an object the linker always keeps).
+          +void xe_ios_install_ios18_polyfills(void);
+          +
+          +#endif  // XENIA_UI_IOS_SHARED_IOS_IOS18_COMPAT_H_
+          --- /dev/null
+          +++ b/src/xenia/ui/ios/shared/ios_ios18_compat.mm
+          @@ -0,0 +1,81 @@
+          +/**
+          + ******************************************************************************
+          + * Xenia : Xbox 360 Emulator Research Project                                 *
+          + ******************************************************************************
+          + * Copyright 2026 Ben Vanik. All rights reserved.                             *
+          + * Released under the BSD license - see LICENSE in the root for more details. *
+          + ******************************************************************************
+          + */
+          +
+          +#import "xenia/ui/ios/shared/ios_ios18_compat.h"
+          +
+          +#import <UIKit/UIKit.h>
+          +#import <objc/runtime.h>
+          +
+          +namespace {
+          +
+          +const void* const kSubtitleKey = &kSubtitleKey;
+          +const void* const kCornerConfigurationKey = &kCornerConfigurationKey;
+          +
+          +// Each polyfill is added only when the running system lacks the method, so on
+          +// iOS 26 and later nothing here is ever used.
+          +void AddIfMissing(Class cls, bool class_method, NSString* selector_name, id block,
+          +                  const char* type_encoding) {
+          +  SEL selector = NSSelectorFromString(selector_name);
+          +  Class target = class_method ? object_getClass(cls) : cls;
+          +  if (class_method ? class_getClassMethod(cls, selector) : class_getInstanceMethod(cls, selector)) {
+          +    return;
+          +  }
+          +  class_addMethod(target, selector, imp_implementationWithBlock(block), type_encoding);
+          +}
+          +
+          +}  // namespace
+          +
+          +void xe_ios_install_ios18_polyfills(void) {
+          +  static dispatch_once_t once;
+          +  dispatch_once(&once, ^{
+          +    // +[UIButtonConfiguration glassButtonConfiguration]: a plain button over a thin blur. Call
+          +    // sites set the image, colours and corner style afterwards.
+          +    AddIfMissing([UIButtonConfiguration class], true, @"glassButtonConfiguration",
+          +                 ^UIButtonConfiguration*(id /*self*/) {
+          +                   UIButtonConfiguration* configuration =
+          +                       [UIButtonConfiguration plainButtonConfiguration];
+          +                   UIBackgroundConfiguration* background =
+          +                       [UIBackgroundConfiguration clearConfiguration];
+          +                   background.visualEffect =
+          +                       [UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemUltraThinMaterial];
+          +                   configuration.background = background;
+          +                   return configuration;
+          +                 },
+          +                 "@@:");
+          +
+          +    // -[UINavigationItem subtitle]: iOS 18 has no subtitle line. Keep the value so reads return
+          +    // what was set.
+          +    AddIfMissing([UINavigationItem class], false, @"subtitle",
+          +                 ^NSString*(id self_) {
+          +                   return objc_getAssociatedObject(self_, kSubtitleKey);
+          +                 },
+          +                 "@@:");
+          +    AddIfMissing([UINavigationItem class], false, @"setSubtitle:",
+          +                 ^(id self_, NSString* subtitle) {
+          +                   objc_setAssociatedObject(self_, kSubtitleKey, subtitle,
+          +                                            OBJC_ASSOCIATION_COPY_NONATOMIC);
+          +                 },
+          +                 "v@:@");
+          +
+          +    // -[UIView cornerConfiguration]: iOS 18 has no such shape, and the class it takes
+          +    // (UICornerConfiguration) does not exist there, so callers pass nil and the view keeps its
+          +    // own layer corners.
+          +    AddIfMissing([UIView class], false, @"cornerConfiguration",
+          +                 ^id(id self_) {
+          +                   return objc_getAssociatedObject(self_, kCornerConfigurationKey);
+          +                 },
+          +                 "@@:");
+          +    AddIfMissing([UIView class], false, @"setCornerConfiguration:",
+          +                 ^(id self_, id configuration) {
+          +                   objc_setAssociatedObject(self_, kCornerConfigurationKey, configuration,
+          +                                            OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+          +                 },
+          +                 "v@:@");
+          +  });
+          +}
+          --- a/src/xenia/ui/ios/shared/ios_view_helpers.mm
+          +++ b/src/xenia/ui/ios/shared/ios_view_helpers.mm
+          @@ -15,6 +15,7 @@
+           
+           #import "xenia/ui/ios/shared/ios_art_wash.h"
+           #import "xenia/ui/ios/shared/ios_glass_card.h"
+          +#import "xenia/ui/ios/shared/ios_ios18_compat.h"
+           #import "xenia/ui/ios/shared/ios_system_utils.h"
+           #import "xenia/ui/ios/shared/ios_theme.h"
+           #import "xenia/ui/ios/shared/ios_theme_controls.h"
+          @@ -197,8 +198,24 @@
+           }  // namespace
+           
+           UIVisualEffect* xe_make_chrome_visual_effect(BOOL clear_variant) {
+          -  UIGlassEffectStyle style = clear_variant ? UIGlassEffectStyleClear : UIGlassEffectStyleRegular;
+          -  return [UIGlassEffect effectWithStyle:style];
+          +  if (@available(iOS 26.0, *)) {
+          +    UIGlassEffectStyle style = clear_variant ? UIGlassEffectStyleClear : UIGlassEffectStyleRegular;
+          +    return [UIGlassEffect effectWithStyle:style];
+          +  }
+          +  // iOS 18-25 fallback: the closest pre-glass UIBlurEffect for each variant.
+          +  // SystemUltraThinMaterial reads as the most transparent, suitable for
+          +  // surfaces sitting on top of rich content (clear-variant callers like the
+          +  // compat hero over game artwork). SystemMaterial is the standard chrome
+          +  // material every other caller has been using.
+          +  UIBlurEffectStyle fallback_style = clear_variant ? UIBlurEffectStyleSystemUltraThinMaterial
+          +                                                   : UIBlurEffectStyleSystemMaterial;
+          +  return [UIBlurEffect effectWithStyle:fallback_style];
+          +}
+          +
+          +// Runs when the app image loads, before any UI exists: adds the iOS 26 UIKit
+          +// methods that are missing on older systems (see ios_ios18_compat.h).
+          +__attribute__((constructor)) static void XEInstallIOS18Polyfills(void) {
+          +  xe_ios_install_ios18_polyfills();
+           }
+           
+           void xe_apply_floating_window_chrome(UIView* view) {
+          --- a/src/xenia/ui/ios/shared/ios_glass_card.mm
+          +++ b/src/xenia/ui/ios/shared/ios_glass_card.mm
+          @@ -313,16 +313,30 @@
+           
+           void XEInstallGlassCardSurface(UIView* card) {
+             card.backgroundColor = [UIColor clearColor];
+          -  UIGlassEffect* effect = [UIGlassEffect effectWithStyle:UIGlassEffectStyleRegular];
+          -  // Enough shade that captions read over the Halo 3 hero, little enough that the art still
+          -  // shows through as colour.
+          -  effect.tintColor = [XeniaTheme glassCardTint];
+          -  UIVisualEffectView* glass = [[[UIVisualEffectView alloc] initWithEffect:effect] autorelease];
+          +  UIVisualEffectView* glass = nil;
+          +  if (@available(iOS 26.0, *)) {
+          +    UIGlassEffect* effect = [UIGlassEffect effectWithStyle:UIGlassEffectStyleRegular];
+          +    // Enough shade that captions read over the Halo 3 hero, little enough that the art still
+          +    // shows through as colour.
+          +    effect.tintColor = [XeniaTheme glassCardTint];
+          +    glass = [[[UIVisualEffectView alloc] initWithEffect:effect] autorelease];
+          +    glass.cornerConfiguration = [UICornerConfiguration
+          +        configurationWithUniformRadius:[UICornerRadius fixedRadius:[XeniaTheme glassCardRadius]]];
+          +  } else {
+          +    // iOS 18-25: a dark system blur with the same shade laid over it; the card's own layer
+          +    // corner radius (set below) gives the shape.
+          +    glass = [[[UIVisualEffectView alloc]
+          +        initWithEffect:[UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemMaterialDark]]
+          +        autorelease];
+          +    UIView* shade = [[[UIView alloc] initWithFrame:glass.contentView.bounds] autorelease];
+          +    shade.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+          +    shade.backgroundColor = [XeniaTheme glassCardTint];
+          +    shade.userInteractionEnabled = NO;
+          +    [glass.contentView addSubview:shade];
+          +  }
+             glass.frame = card.bounds;
+             glass.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+             glass.userInteractionEnabled = NO;
+          -  glass.cornerConfiguration = [UICornerConfiguration
+          -      configurationWithUniformRadius:[UICornerRadius fixedRadius:[XeniaTheme glassCardRadius]]];
+             [card insertSubview:glass atIndex:0];
+             // The content clips to the same shape; the glass draws its own rim.
+             card.layer.cornerRadius = [XeniaTheme glassCardRadius];
+          --- a/src/xenia/ui/ios/game/ios_shader_compile_indicator.mm
+          +++ b/src/xenia/ui/ios/game/ios_shader_compile_indicator.mm
+          @@ -142,9 +142,13 @@
+           // Always dark, like the system's Game Mode banner, and tinted so the text keeps
+           // WCAG AA contrast (4.5:1) even over a white frame.
+           UIVisualEffect* BackdropEffect() {
+          -  UIGlassEffect* glass = [UIGlassEffect effectWithStyle:UIGlassEffectStyleRegular];
+          -  glass.tintColor = [UIColor colorWithWhite:0.0 alpha:0.7];
+          -  return glass;
+          +  if (@available(iOS 26.0, *)) {
+          +    UIGlassEffect* glass = [UIGlassEffect effectWithStyle:UIGlassEffectStyleRegular];
+          +    glass.tintColor = [UIColor colorWithWhite:0.0 alpha:0.7];
+          +    return glass;
+          +  }
+          +  // iOS 18-25: the dark system material, always dark like the glass above.
+          +  return [UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemChromeMaterialDark];
+           }
+           
+           // The explanation and the icon: dimmer than the title, brighter than the system's
+          --- a/src/xenia/ui/ios/launcher/ios_launcher_overlay_view.mm
+          +++ b/src/xenia/ui/ios/launcher/ios_launcher_overlay_view.mm
+          @@ -951,7 +951,14 @@
+                 [[[UIVisualEffectView alloc] initWithEffect:xe_make_chrome_visual_effect(NO)] autorelease];
+             capsule.translatesAutoresizingMaskIntoConstraints = NO;
+             // The glass's own shape: a layer corner radius is lost when the + menu folds back into it.
+          -  capsule.cornerConfiguration = [UICornerConfiguration capsuleConfiguration];
+          +  if (@available(iOS 26.0, *)) {
+          +    capsule.cornerConfiguration = [UICornerConfiguration capsuleConfiguration];
+          +  } else {
+          +    // iOS 18-25: the capsule is the fixed 44 pt height below, so half of it is the radius.
+          +    capsule.layer.cornerRadius = 22.0;
+          +    capsule.layer.cornerCurve = kCACornerCurveContinuous;
+          +    capsule.clipsToBounds = YES;
+          +  }
+             UIStackView* capsuleStack = [[[UIStackView alloc]
+                 initWithArrangedSubviews:@[ _openGameButton, _settingsButton, _profileButton ]] autorelease];
+             capsuleStack.translatesAutoresizingMaskIntoConstraints = NO;
+          XENIOS_IOS18_PATCH
+          if git apply --check "${RUNNER_TEMP}/ios18.patch" 2>logs/patch-check.log; then
+            git apply --whitespace=nowarn "${RUNNER_TEMP}/ios18.patch"
+            echo "Patch applied."
+          elif git apply -R --check "${RUNNER_TEMP}/ios18.patch" 2>/dev/null; then
+            echo "Patch already present in this branch; skipping."
+          else
+            cat logs/patch-check.log
+            echo "::error::The iOS 18 patch does not apply to this branch (it expects XeniOS commit 5533fbfd1)."
+            exit 1
+          fi
+          grep -q 'CMAKE_OSX_DEPLOYMENT_TARGET "18.0"' CMakeLists.txt
+          test -f src/xenia/ui/ios/shared/ios_ios18_compat.mm
+
+      - name: Select Xcode 27
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcode="$(ls -d /Applications/Xcode_27*.app 2>/dev/null | sort -V | tail -n 1 || true)"
+          if [ -z "${xcode}" ]; then
+            echo "::error::No Xcode 27 on this runner:"
+            ls -d /Applications/Xcode*.app || true
+            exit 1
+          fi
+          sudo xcode-select -s "${xcode}"
+          xcodebuild -version
+
+      - name: Install Metal Toolchain
+        shell: bash
+        run: |
+          for attempt in 1 2 3 4 5; do
+            if sudo xcodebuild -downloadComponent MetalToolchain; then
+              exit 0
+            fi
+            if [ $attempt -lt 5 ]; then
+              delay=$((attempt * 30))
+              echo "::warning::MetalToolchain download attempt $attempt failed; retrying in ${delay}s"
+              sleep $delay
+            fi
+          done
+          echo "::error::MetalToolchain download failed after 5 attempts"
+          exit 1
+
+      # ccache only speeds up a rerun after a failure; if it can't be set up the
+      # build simply runs without it.
+      - name: Set up ccache
+        id: ccache
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew install ccache
+          {
+            echo "CCACHE_DIR=${RUNNER_TEMP}/ccache"
+            echo "CCACHE_MAXSIZE=3G"
+            echo "CCACHE_COMPILERCHECK=content"
+            echo "CMAKE_C_COMPILER_LAUNCHER=ccache"
+            echo "CMAKE_CXX_COMPILER_LAUNCHER=ccache"
+            echo "CMAKE_OBJC_COMPILER_LAUNCHER=ccache"
+            echo "CMAKE_OBJCXX_COMPILER_LAUNCHER=ccache"
+          } >> "$GITHUB_ENV"
+          echo "enabled=true" >> "$GITHUB_OUTPUT"
+
+      - name: Restore ccache
+        if: steps.ccache.outputs.enabled == 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/ccache
+          key: ccache-ios18-${{ github.run_id }}
+          restore-keys: |
+            ccache-ios18-
+
+      - name: Cache Slang
+        id: cache-slang
+        uses: actions/cache@v4
+        with:
+          path: .slang
+          # Keep in sync with SLANG_VERSION in xenia-build.py.
+          key: ${{ runner.os }}-${{ runner.arch }}-slang-2026.8
+
+      - name: Download Slang
+        if: steps.cache-slang.outputs.cache-hit != 'true'
+        run: ./xenia-build.py slang
+
+      - name: Cache Metal Shader Converter (macOS)
+        id: cache-msc
+        uses: actions/cache@v4
+        with:
+          path: .metal-shader-converter
+          # Keep in sync with MSC_VERSION in xenia-build.py.
+          key: ${{ runner.os }}-metal-shader-converter-4.0-beta2
+
+      - name: Download Metal Shader Converter (macOS, for the host shader tool's configure)
+        if: steps.cache-msc.outputs.cache-hit != 'true'
+        run: ./xenia-build.py msc
+
+      - name: Download Metal Shader Converter (iOS)
+        shell: bash
+        env:
+          GH_TOKEN: "${{ github.token }}"
+        run: |
+          set -euo pipefail
+          msc_dir="${RUNNER_TEMP}/msc-ios"
+          mkdir -p "${msc_dir}"
+          gh release download "${MSC_IOS_RELEASE_TAG}" --repo "${MSC_IOS_REPO}" \
+            --pattern libmetalirconverter.dylib --dir "${msc_dir}" --clobber
+          dylib="${msc_dir}/libmetalirconverter.dylib"
+          echo "${MSC_IOS_SHA256}  ${dylib}" | shasum -a 256 -c -
+          codesign --verify --strict "${dylib}"
+          xcrun vtool -show-build "${dylib}" | grep "platform IOS"
+          echo "MSC_IOS_LIBRARY=${dylib}" >> "$GITHUB_ENV"
+
+      - name: Fetch submodules and data
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            # DirectXShaderCompiler isn't needed: the DXIL the Metal backend converts
+            # comes from Mesa's spirv_to_dxil.
+            git submodule update --init --depth=1 -j"$(sysctl -n hw.ncpu)" \
+              $(grep -oE 'path = .+' .gitmodules | sed 's/path = //' \
+                | grep -v 'DirectXShaderCompiler')
+            # wxWidgets has nested submodules that the macOS configure reads.
+            git submodule update --init --recursive --depth=1 \
+              -j"$(sysctl -n hw.ncpu)" third_party/wxWidgets
+            # game-patches and the compatibility data baked into the app.
+            ./xenia-build.py fetchdata
+          } 2>&1 | tee logs/01-submodules.log
+
+      - name: Set up Python for Meson
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install Meson for spirv_to_dxil
+        run: python3 -m pip install --upgrade meson mako pyyaml packaging
+
+      - name: Build the host shader tool
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            cmake -S . -B build-host -G Ninja -DCMAKE_BUILD_TYPE=Release
+            cmake --build build-host --target xenia-shader-cc
+          } 2>&1 | tee logs/02-host-tool.log
+          tool="$(find build-host -type f -name xenia-shader-cc -perm -u+x -print -quit)"
+          [ -n "${tool}" ] || { echo "::error::xenia-shader-cc was not built"; exit 1; }
+          echo "XENIA_SHADER_CC=${GITHUB_WORKSPACE}/${tool}" >> "$GITHUB_ENV"
+
+      - name: Configure the iOS build (deployment target 18.0)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p build-ios/lto-objects
+          cmake -S . -B build-ios -G "Ninja Multi-Config" \
+            -DCMAKE_EXE_LINKER_FLAGS="-Wl,-object_path_lto,${GITHUB_WORKSPACE}/build-ios/lto-objects" \
+            -DCMAKE_SYSTEM_NAME=iOS \
+            -DCMAKE_OSX_SYSROOT=iphoneos \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=18.0 \
+            -DCMAKE_CONFIGURATION_TYPES=Release \
+            -DXENIA_BUILD_IOS_TRACE_APP=OFF \
+            -DXENIA_IOS_COMPATIBILITY_DATA_DIR="${GITHUB_WORKSPACE}/build/data_repos/game-compatibility" \
+            -DXENIA_IOS_HOST_SHADER_COMPILER="${XENIA_SHADER_CC}" \
+            -DXENIA_IOS_SHADER_CONVERTER_LIBRARY="${MSC_IOS_LIBRARY}" \
+            2>&1 | tee logs/03-configure.log
+
+      - name: Compile the iOS app (keeps going to list every error)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake --build build-ios --config Release --target xenia-app -- -k 0 \
+            2>&1 | tee logs/04-compile.log
+
+      - name: Package XeniOS.ipa
+        shell: bash
+        env:
+          VERSION: "2.3.2"
+        run: |
+          set -euo pipefail
+          # No attestation key and no diagnostics URL: a self-built IPA that
+          # sends nothing anywhere.
+          ./tools/build_apple_release.sh \
+            --ios-build-dir build-ios \
+            --out scratch/artifacts \
+            --channel preview \
+            --version "${VERSION}" \
+            --stage alpha \
+            --ios-min 18.0 2>&1 | tee logs/05-package.log
+          mkdir -p dist
+          cp scratch/artifacts/xenios_ios_iphone_ipad.ipa dist/XeniOS.ipa
+          ls -l dist
+
+      - name: Check the IPA's minimum iOS version
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf ipa-check && mkdir ipa-check
+          unzip -q dist/XeniOS.ipa -d ipa-check
+          app="$(ls -d ipa-check/Payload/*.app | head -n 1)"
+          exe="${app}/$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "${app}/Info.plist")"
+          {
+            echo "### XeniOS.ipa built"
+            echo "Info.plist MinimumOSVersion: $(/usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion' "${app}/Info.plist")"
+            echo '```'
+            xcrun vtool -show-build "${exe}"
+            echo '```'
+            echo "iOS 26 calls still used without a version check (each may crash on iOS 18): $(grep -c 'unguarded-availability' logs/04-compile.log || true) warning lines"
+            echo '```'
+            grep -h 'warning:.*unguarded-availability' logs/04-compile.log | sed 's#.*/src/#src/#' | sort -u | head -60 || true
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          xcrun vtool -show-build "${exe}" | grep -q 'minos 18.0' \
+            || { echo "::error::The binary's minos is not 18.0"; exit 1; }
+
+      - name: Upload XeniOS.ipa
+        uses: actions/upload-artifact@v4
+        with:
+          name: "XeniOS-ipa"
+          path: "dist/XeniOS.ipa"
+          if-no-files-found: error
+
+      - name: Attach XeniOS.ipa to a pre-release
+        if: ${{ inputs.make_release }}
+        shell: bash
+        env:
+          GH_TOKEN: "${{ github.token }}"
+        run: |
+          set -euo pipefail
+          tag="ios18-run${{ github.run_number }}"
+          gh release delete "${tag}" --yes --cleanup-tag 2>/dev/null || true
+          gh release create "${tag}" dist/XeniOS.ipa \
+            --target "${{ github.sha }}" \
+            --prerelease \
+            --title "XeniOS iOS 18 build ${{ github.run_number }} (unofficial, untested)" \
+            --notes "Self-built, ad-hoc-signed IPA for iOS 18.0 and later. It must be re-signed by a sideloading tool to install. Not tested by the author of the patch: treat it as experimental."
+          echo "Release: ${{ github.server_url }}/${{ github.repository }}/releases/tag/${tag}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Save ccache
+        if: always() && steps.ccache.outputs.enabled == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/ccache
+          key: ccache-ios18-${{ github.run_id }}
+
+      - name: Show the errors on the run page
+        if: failure()
+        shell: bash
+        run: |
+          {
+            echo "### The build failed"
+            echo "Full logs: download the artifact **build-logs** from this run's page."
+            echo "First errors found:"
+            echo '```'
+            grep -h -E 'error:|fatal error|FAILED:|CMake Error|ld: ' logs/*.log 2>/dev/null | sed 's#.*/src/#src/#' | head -80 || true
+            echo '```'
+            echo "End of the newest log:"
+            echo '```'
+            tail -n 40 "$(ls -t logs/*.log 2>/dev/null | head -n 1)" 2>/dev/null || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: "build-logs"
+          path: |
+            logs/
+            build-ios/CMakeFiles/CMakeConfigureLog.yaml
+            build-ios/CMakeFiles/CMakeError.log
+            build-ios/CMakeFiles/CMakeOutput.log
+          if-no-files-found: ignore
+          retention-days: 30
